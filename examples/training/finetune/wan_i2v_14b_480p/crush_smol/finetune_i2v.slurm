@@ -1,13 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=i2v
 #SBATCH --partition=main
-#SBATCH --qos=hao
 #SBATCH --nodes=4
 #SBATCH --ntasks=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=128
-#SBATCH --nodelist=fs-mbz-gpu-[100-850]
 #SBATCH --mem=1440G
 #SBATCH --output=i2v_output/i2v_%j.out
 #SBATCH --error=i2v_output/i2v_%j.err
@@ -42,7 +40,7 @@ NUM_GPUS=8
 
 MODEL_PATH="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
 DATA_DIR="data/crush-smol_processed_i2v/combined_parquet_dataset/"
-VALIDATION_DIR="data/crush-smol_processed_i2v/validation_parquet_dataset/"
+VALIDATION_DATASET_FILE="examples/training/finetune/wan_i2v_14b_480p/crush_smol/validation.json"
 # export CUDA_VISIBLE_DEVICES=4,5
 # IP=[MASTER NODE IP]
 
@@ -60,13 +58,14 @@ training_args=(
   --num_height 480
   --num_width 832
   --num_frames 77
+  --enable_gradient_checkpointing_type "full"
 )
 
 # Parallel arguments
 parallel_args=(
   --num_gpus $NUM_GPUS
   --sp_size $NUM_GPUS
-  --tp_size $NUM_GPUS
+  --tp_size 1
   --hsdp_replicate_dim $SLURM_JOB_NUM_NODES
   --hsdp_shard_dim $NUM_GPUS
 )
@@ -86,7 +85,7 @@ dataset_args=(
 # Validation arguments
 validation_args=(
   --log_validation
-  --validation_preprocessed_path "$VALIDATION_DIR"
+  --validation_dataset_file "$VALIDATION_DATASET_FILE"
   --validation_steps 100
   --validation_sampling_steps "40"
   --validation_guidance_scale "1.0"
@@ -112,6 +111,7 @@ miscellaneous_args=(
   --dit_precision "fp32"
   --num_euler_timesteps 50
   --ema_start_step 0
+  --enable_gradient_checkpointing_type "full"
 )
 
 srun torchrun \

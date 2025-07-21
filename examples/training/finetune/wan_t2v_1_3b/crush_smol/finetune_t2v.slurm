@@ -1,13 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=t2v
 #SBATCH --partition=main
-#SBATCH --qos=hao
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=128
-#SBATCH --nodelist=fs-mbz-gpu-[100-850]
 #SBATCH --mem=1440G
 #SBATCH --output=t2v_output/t2v_%j.out
 #SBATCH --error=t2v_output/t2v_%j.err
@@ -41,7 +39,7 @@ echo "NODE_RANK: $NODE_RANK"
 NUM_GPUS=8
 MODEL_PATH="Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 DATA_DIR="data/crush-smol_processed_t2v/combined_parquet_dataset/"
-VALIDATION_DIR="data/crush-smol_processed_t2v/validation_parquet_dataset/"
+VALIDATION_DATASET_FILE="examples/training/finetune/wan_t2v_1_3b/crush_smol/validation.json"
 # export CUDA_VISIBLE_DEVICES=4,5
 # IP=[MASTER NODE IP]
 
@@ -57,13 +55,14 @@ training_args=(
   --num_height 480
   --num_width 832
   --num_frames 77
+  --enable_gradient_checkpointing_type "full"
 )
 
 # Parallel arguments
 parallel_args=(
   --num_gpus $NUM_GPUS
   --sp_size 4
-  --tp_size 4
+  --tp_size 1
   --hsdp_replicate_dim 2
   --hsdp_shard_dim 4
 )
@@ -83,7 +82,7 @@ dataset_args=(
 # Validation arguments
 validation_args=(
   --log_validation
-  --validation_preprocessed_path "$VALIDATION_DIR"
+  --validation_dataset_file "$VALIDATION_DATASET_FILE"
   --validation_steps 100
   --validation_sampling_steps "50"
   --validation_guidance_scale "1.0"
@@ -109,6 +108,7 @@ miscellaneous_args=(
   --dit_precision "fp32"
   --num_euler_timesteps 50
   --ema_start_step 0
+  --enable_gradient_checkpointing_type "full"
 )
 
 srun torchrun \

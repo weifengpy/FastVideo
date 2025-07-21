@@ -6,16 +6,17 @@ import argparse
 import dataclasses
 from contextlib import contextmanager
 from dataclasses import field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastvideo.v1.configs.pipelines.base import PipelineConfig, STA_Mode
 from fastvideo.v1.logger import init_logger
+from fastvideo.v1.platforms import current_platform
 from fastvideo.v1.utils import FlexibleArgumentParser, StoreBoolean
 
 logger = init_logger(__name__)
 
 
-def clean_cli_args(args: argparse.Namespace) -> Dict[str, Any]:
+def clean_cli_args(args: argparse.Namespace) -> dict[str, Any]:
     """
     Clean the arguments by removing the ones that not explicitly provided by the user.
     """
@@ -44,7 +45,7 @@ class FastVideoArgs:
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
-    revision: Optional[str] = None
+    revision: str | None = None
 
     # Parallelism
     num_gpus: int = 1
@@ -52,17 +53,28 @@ class FastVideoArgs:
     sp_size: int = -1
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: int = -1
-    dist_timeout: Optional[int] = None  # timeout for torch.distributed
+    dist_timeout: int | None = None  # timeout for torch.distributed
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig)
 
+    # LoRA parameters
+    # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
+    lora_path: str | None = None
+    lora_nickname: str = "default"  # for swapping adapters in the pipeline
+    # can restrict layers to adapt, e.g. ["q_proj"]
+    # For inference, will be consistent with loaded adapter by default
+    # For training, will adapt only q, k, v, o by default.
+    lora_target_modules: list[str] | None = None
+
     output_type: str = "pil"
 
-    use_cpu_offload: bool = True
+    use_cpu_offload: bool = True  # For DiT
     use_fsdp_inference: bool = True
+    text_encoder_offload: bool = True
+    pin_cpu_memory: bool = True
 
     # STA (Sliding Tile Attention) parameters
-    mask_strategy_file_path: Optional[str] = None
+    mask_strategy_file_path: str | None = None
     STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
     skip_time_steps: int = 15
 
@@ -76,6 +88,13 @@ class FastVideoArgs:
 
     # Stage verification
     enable_stage_verification: bool = True
+
+    # model paths for correct deallocation
+    model_paths: dict[str, str] = field(default_factory=dict)
+    model_loaded: dict[str, bool] = field(default_factory=lambda: {
+        "transformer": True,
+        "vae": True,
+    })
 
     @property
     def training_mode(self) -> bool:
@@ -208,7 +227,7 @@ class FastVideoArgs:
             "--use-cpu-offload",
             action=StoreBoolean,
             help=
-            "Use CPU offload for model inference. Enable if run out of memory with FSDP.",
+            "Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
         )
         parser.add_argument(
             "--use-fsdp-inference",
@@ -216,7 +235,19 @@ class FastVideoArgs:
             help=
             "Use FSDP for inference by sharding the model weights. Latency is very low due to prefetch--enable if run out of memory.",
         )
-
+        parser.add_argument(
+            "--text-encoder-cpu-offload",
+            action=StoreBoolean,
+            help=
+            "Use CPU offload for text encoder. Enable if run out of memory.",
+        )
+        parser.add_argument(
+            "--pin-cpu-memory",
+            action=StoreBoolean,
+            help=
+            "Pin memory for CPU offload. Only added as a temp workaround if it throws \"CUDA error: invalid argument\". "
+            "Should be enabled in almost all cases",
+        )
         parser.add_argument(
             "--disable-autocast",
             action=StoreBoolean,
@@ -259,26 +290,37 @@ class FastVideoArgs:
                 kwargs[attr] = pipeline_config
             # Use getattr with default value from the dataclass for potentially missing attributes
             else:
-                default_value = getattr(cls, attr, None)
+                # Get the field to check if it has a default_factory
+                field = dataclasses.fields(cls)[next(
+                    i for i, f in enumerate(dataclasses.fields(cls))
+                    if f.name == attr)]
+                if field.default_factory is not dataclasses.MISSING:
+                    # Use the default_factory to create the default value
+                    default_value = field.default_factory()
+                else:
+                    default_value = getattr(cls, attr, None)
                 value = getattr(args, attr, default_value)
                 kwargs[attr] = value  # type: ignore
 
         return cls(**kwargs)  # type: ignore
 
     @classmethod
-    def from_kwargs(cls, kwargs: Dict[str, Any]) -> "FastVideoArgs":
+    def from_kwargs(cls, **kwargs: Any) -> "FastVideoArgs":
         kwargs['pipeline_config'] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
     def check_fastvideo_args(self) -> None:
         """Validate inference arguments for consistency"""
+        if current_platform.is_mps():
+            self.use_fsdp_inference = False
+
         if not self.inference_mode:
             assert self.hsdp_replicate_dim != -1, "hsdp_replicate_dim must be set for training"
             assert self.hsdp_shard_dim != -1, "hsdp_shard_dim must be set for training"
             assert self.sp_size != -1, "sp_size must be set for training"
 
         if self.tp_size == -1:
-            self.tp_size = self.num_gpus
+            self.tp_size = 1
         if self.sp_size == -1:
             self.sp_size = self.num_gpus
         if self.hsdp_shard_dim == -1:
@@ -290,11 +332,6 @@ class FastVideoArgs:
 
         if self.num_gpus < max(self.tp_size, self.sp_size):
             self.num_gpus = max(self.tp_size, self.sp_size)
-
-        if self.tp_size != self.sp_size:
-            raise ValueError(
-                f"tp_size ({self.tp_size}) must be equal to sp_size ({self.sp_size})"
-            )
 
         if self.enable_torch_compile and self.num_gpus > 1:
             logger.warning(
@@ -311,7 +348,7 @@ class FastVideoArgs:
 _current_fastvideo_args = None
 
 
-def prepare_fastvideo_args(argv: List[str]) -> FastVideoArgs:
+def prepare_fastvideo_args(argv: list[str]) -> FastVideoArgs:
     """
     Prepare the inference arguments from the command line arguments.
 
@@ -396,7 +433,7 @@ class TrainingArgs(FastVideoArgs):
     log_validation: bool = False
     tracker_project_name: str = ""
     wandb_run_name: str = ""
-    seed: Optional[int] = None
+    seed: int | None = None
 
     # output
     output_dir: str = ""
@@ -413,7 +450,7 @@ class TrainingArgs(FastVideoArgs):
     lr_scheduler: str = "constant"
     lr_warmup_steps: int = 0
     max_grad_norm: float = 0.0
-    gradient_checkpointing: bool = False
+    enable_gradient_checkpointing_type: str | None = None
     selective_checkpointing: float = 0.0
     allow_tf32: bool = False
     mixed_precision: str = ""
@@ -447,6 +484,11 @@ class TrainingArgs(FastVideoArgs):
     VSA_decay_rate: float = 0.01  # decay rate -> 0.02
     VSA_decay_interval_steps: int = 1  # decay interval steps -> 50
 
+    # LoRA training parameters
+    lora_rank: int | None = None
+    lora_alpha: int | None = None
+    lora_training: bool = False
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "TrainingArgs":
         provided_args = clean_cli_args(args)
@@ -454,16 +496,31 @@ class TrainingArgs(FastVideoArgs):
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         logger.info(provided_args)
         # Create a dictionary of attribute values, with defaults for missing attributes
-        kwargs = {}
+        kwargs: dict[str, Any] = {}
         for attr in attrs:
             if attr == 'pipeline_config':
                 pipeline_config = PipelineConfig.from_kwargs(provided_args)
                 kwargs[attr] = pipeline_config
-            # Use getattr with default value from the dataclass for potentially missing attributes
             else:
-                default_value = getattr(cls, attr, None)
-                value = getattr(args, attr, default_value)
-                kwargs[attr] = value  # type: ignore
+                # Get the field to check its default value
+                field = dataclasses.fields(cls)[next(
+                    i for i, f in enumerate(dataclasses.fields(cls))
+                    if f.name == attr)]
+
+                # Check if the attribute is provided in args
+                if hasattr(args, attr):
+                    value = getattr(args, attr)
+                else:
+                    # Use the field's default value
+                    if field.default_factory is not dataclasses.MISSING:
+                        value = field.default_factory()
+                    elif field.default is not dataclasses.MISSING:
+                        value = field.default
+                    else:
+                        # No default value, use None
+                        value = None
+
+                kwargs[attr] = value
 
         return cls(**kwargs)  # type: ignore
 
@@ -612,9 +669,11 @@ class TrainingArgs(FastVideoArgs):
         parser.add_argument("--max-grad-norm",
                             type=float,
                             help="Maximum gradient norm")
-        parser.add_argument("--gradient-checkpointing",
-                            action=StoreBoolean,
-                            help="Whether to use gradient checkpointing")
+        parser.add_argument("--enable-gradient-checkpointing-type",
+                            type=str,
+                            choices=["full", "ops", "block_skip"],
+                            default=None,
+                            help="Gradient checkpointing type")
         parser.add_argument("--selective-checkpointing",
                             type=float,
                             help="Selective checkpointing threshold")
@@ -710,5 +769,10 @@ class TrainingArgs(FastVideoArgs):
             type=int,
             default=TrainingArgs.VSA_decay_interval_steps,
             help="VSA decay interval steps")
+        parser.add_argument("--lora-training",
+                            action=StoreBoolean,
+                            help="Whether to use LoRA training")
+        parser.add_argument("--lora-rank", type=int, help="LoRA rank")
+        parser.add_argument("--lora-alpha", type=int, help="LoRA alpha")
 
         return parser

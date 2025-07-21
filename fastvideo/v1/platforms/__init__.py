@@ -2,7 +2,7 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/__init__.py
 
 import traceback
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from fastvideo.v1.logger import init_logger
 # imported by other files, do not remove
@@ -13,7 +13,7 @@ from fastvideo.v1.utils import resolve_obj_by_qualname
 logger = init_logger(__name__)
 
 
-def cuda_platform_plugin() -> Optional[str]:
+def cuda_platform_plugin() -> str | None:
     is_cuda = False
 
     try:
@@ -47,19 +47,57 @@ def cuda_platform_plugin() -> Optional[str]:
     return "fastvideo.v1.platforms.cuda.CudaPlatform" if is_cuda else None
 
 
+def mps_platform_plugin() -> str | None:
+    """Detect if MPS (Metal Performance Shaders) is available on macOS."""
+    is_mps = False
+
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            is_mps = True
+            logger.info("MPS (Metal Performance Shaders) is available")
+        else:
+            logger.info("MPS is not available")
+    except Exception as e:
+        logger.info("MPS detection failed: %s", e)
+
+    return "fastvideo.v1.platforms.mps.MpsPlatform" if is_mps else None
+
+
+def cpu_platform_plugin() -> str | None:
+    """Detect if CPU platform should be used."""
+    # CPU is always available as a fallback
+    return "fastvideo.v1.platforms.cpu.CpuPlatform"
+
+
 builtin_platform_plugins = {
     'cuda': cuda_platform_plugin,
+    'mps': mps_platform_plugin,
+    'cpu': cpu_platform_plugin,
 }
 
 
 def resolve_current_platform_cls_qualname() -> str:
     # TODO(will): if we need to support other platforms, we should consider if
     # vLLM's plugin architecture is suitable for our needs.
-    platform_cls_qualname = builtin_platform_plugins['cuda']()
-    if platform_cls_qualname is None:
-        raise RuntimeError("No platform plugin found. Please check your "
-                           "installation.")
-    return platform_cls_qualname
+
+    # Try MPS first on macOS
+    platform_cls_qualname = mps_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Fall back to CUDA
+    platform_cls_qualname = cuda_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Fall back to CPU as last resort
+    platform_cls_qualname = cpu_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    raise RuntimeError("No platform plugin found. Please check your "
+                       "installation.")
 
 
 _current_platform = None

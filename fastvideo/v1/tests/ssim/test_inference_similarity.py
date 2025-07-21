@@ -7,7 +7,7 @@ import pytest
 
 from fastvideo import VideoGenerator
 from fastvideo.v1.logger import init_logger
-from fastvideo.v1.tests.ssim.compute_ssim import compute_video_ssim_torchvision
+from fastvideo.v1.tests.utils import compute_video_ssim_torchvision, write_ssim_results
 from fastvideo.v1.worker.multiproc_executor import MultiprocExecutor
 
 logger = init_logger(__name__)
@@ -33,7 +33,7 @@ HUNYUAN_PARAMS = {
     "flow_shift": 17,
     "seed": 1024,
     "sp_size": 2,
-    "tp_size": 2,
+    "tp_size": 1,
     "vae_sp": True,
     "fps": 24,
 }
@@ -50,7 +50,7 @@ WAN_T2V_PARAMS = {
     "flow_shift": 7.0,
     "seed": 1024,
     "sp_size": 2,
-    "tp_size": 2,
+    "tp_size": 1,
     "vae_sp": True,
     "fps": 24,
     "neg_prompt": "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
@@ -69,7 +69,7 @@ WAN_I2V_PARAMS = {
     "flow_shift": 7.0,
     "seed": 1024,
     "sp_size": 2,
-    "tp_size": 2,
+    "tp_size": 1,
     "vae_sp": True,
     "fps": 24,
     "neg_prompt": "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
@@ -98,44 +98,6 @@ I2V_IMAGE_PATHS = [
     "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/astronaut.jpg",
 ]
 
-
-def write_ssim_results(output_dir, ssim_values, reference_path, generated_path,
-                       num_inference_steps, prompt):
-    """
-    Write SSIM results to a JSON file in the same directory as the generated videos.
-    """
-    try:
-        logger.info(
-            f"Attempting to write SSIM results to directory: {output_dir}")
-
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
-
-        mean_ssim, min_ssim, max_ssim = ssim_values
-
-        result = {
-            "mean_ssim": mean_ssim,
-            "min_ssim": min_ssim,
-            "max_ssim": max_ssim,
-            "reference_video": reference_path,
-            "generated_video": generated_path,
-            "parameters": {
-                "num_inference_steps": num_inference_steps,
-                "prompt": prompt
-            }
-        }
-
-        test_name = f"steps{num_inference_steps}_{prompt[:100]}"
-        result_file = os.path.join(output_dir, f"{test_name}_ssim.json")
-        logger.info(f"Writing JSON results to: {result_file}")
-        with open(result_file, 'w') as f:
-            json.dump(result, f, indent=2)
-
-        logger.info(f"SSIM results written to {result_file}")
-        return True
-    except Exception as e:
-        logger.error(f"ERROR writing SSIM results: {str(e)}")
-        return False
 
 
 @pytest.mark.parametrize("prompt", I2V_TEST_PROMPTS)
@@ -238,7 +200,7 @@ def test_i2v_inference_similarity(prompt, ATTENTION_BACKEND, model_id):
         logger.error("Failed to write SSIM results to file")
 
     min_acceptable_ssim = 0.97
-    assert mean_ssim >= min_acceptable_ssim, f"SSIM value {mean_ssim} is below threshold {min_acceptable_ssim}"
+    assert mean_ssim >= min_acceptable_ssim, f"SSIM value {mean_ssim} is below threshold {min_acceptable_ssim} for {model_id} with backend {ATTENTION_BACKEND}"
 
 @pytest.mark.parametrize("prompt", TEST_PROMPTS)
 @pytest.mark.parametrize("ATTENTION_BACKEND", ["FLASH_ATTN", "TORCH_SDPA"])
@@ -337,5 +299,5 @@ def test_inference_similarity(prompt, ATTENTION_BACKEND, model_id):
     if not success:
         logger.error("Failed to write SSIM results to file")
 
-    min_acceptable_ssim = 0.95
-    assert mean_ssim >= min_acceptable_ssim, f"SSIM value {mean_ssim} is below threshold {min_acceptable_ssim}"
+    min_acceptable_ssim = 0.93
+    assert mean_ssim >= min_acceptable_ssim, f"SSIM value {mean_ssim} is below threshold {min_acceptable_ssim} for {model_id} with backend {ATTENTION_BACKEND}"

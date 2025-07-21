@@ -1,21 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-# TODO: check if correct
 import os
 
 import numpy as np
 import pytest
 import torch
-from transformers import AutoConfig
-
-from fastvideo.models.hunyuan.text_encoder import (load_text_encoder,
-                                                   load_tokenizer)
-# from fastvideo.v1.models.hunyuan.text_encoder import load_text_encoder, load_tokenizer
+from transformers import AutoConfig, AutoTokenizer, CLIPTextModel
+import gc
 from fastvideo.v1.configs.pipelines import PipelineConfig
 from fastvideo.v1.forward_context import set_forward_context
 from fastvideo.v1.fastvideo_args import FastVideoArgs
 from fastvideo.v1.logger import init_logger
 from fastvideo.v1.utils import maybe_download_model
 from fastvideo.v1.configs.models.encoders import CLIPTextConfig
+from torch.distributed.tensor import DTensor
+from torch.testing import assert_close
 
 logger = init_logger(__name__)
 
@@ -27,6 +25,7 @@ MODEL_PATH = maybe_download_model(BASE_MODEL_PATH,
                                   local_dir=os.path.join(
                                       "data", BASE_MODEL_PATH))
 TEXT_ENCODER_PATH = os.path.join(MODEL_PATH, "text_encoder_2")
+TOKENIZER_PATH = os.path.join(MODEL_PATH, "tokenizer_2")
 
 
 @pytest.mark.usefixtures("distributed_setup")
@@ -52,21 +51,16 @@ def test_clip_encoder():
     print(hf_config)
     print(hf_config.use_return_dict)
 
-    # Load our implementation using the loader from text_encoder/__init__.py
-    model1, _ = load_text_encoder(text_encoder_type="clipL",
-                                  text_encoder_precision='fp16',
-                                  text_encoder_path=TEXT_ENCODER_PATH,
-                                  logger=logger,
-                                  device=device)
+    # Load HuggingFace implementation
+    model1 = CLIPTextModel.from_pretrained(TEXT_ENCODER_PATH).to(torch.float16).to(device).eval()
 
     from fastvideo.v1.models.loader.component_loader import TextEncoderLoader
     loader = TextEncoderLoader()
-    model2 = loader.load(TEXT_ENCODER_PATH, "", args)
+    model2 = loader.load(TEXT_ENCODER_PATH, args)
 
     # Load the HuggingFace implementation directly
     # model2 = CLIPTextModel(hf_config)
     # model2 = model2.to(torch.float16)
-    model2 = model2.to(device)
     model2.eval()
 
     # Sanity check weights between the two models
@@ -78,23 +72,22 @@ def test_clip_encoder():
     logger.info("Model1 has %d parameters", len(params1))
     logger.info("Model2 has %d parameters", len(params2))
 
-    # Compare a few key parameters
-
-    # weight_diffs = []
-    # for (name1, param1), (name2, param2) in zip(
-    #     sorted(params1.items()), sorted(params2.items())
-    # ):
-    #     # if len(weight_diffs) < 5:  # Just check a few parameters
-    #     max_diff = torch.max(torch.abs(param1 - param2)).item()
-    #     mean_diff = torch.mean(torch.abs(param1 - param2)).item()
-    #     weight_diffs.append((name1, name2, max_diff, mean_diff))
-    #     logger.info(f"Parameter: {name1} vs {name2}")
-    #     logger.info(f"  Max diff: {max_diff}, Mean diff: {mean_diff}")
-
+    for name1, param1 in sorted(params1.items()):
+        name2 = name1
+        skip = False
+        for param_name, weight_name, shard_id in model2.config.arch_config.stacked_params_mapping:
+            if weight_name not in name1:
+                skip = True
+        # stacked params are more troublesome
+        if skip:
+            continue
+        param2 = params2[name2]
+        param2 = param2.to_local().to(device) if isinstance(param2, DTensor) else param2.to(device)
+        assert_close(param1, param2, atol=1e-4, rtol=1e-4)
+    gc.collect()
+    torch.cuda.empty_cache()
     # Load tokenizer
-    tokenizer, _ = load_tokenizer(tokenizer_type="clipL",
-                                  tokenizer_path=args.model_path,
-                                  logger=logger)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
 
     # Test with some sample prompts
     prompts = [
@@ -109,7 +102,11 @@ def test_clip_encoder():
             logger.info("Testing prompt: '%s'", prompt)
 
             # Tokenize the prompt
-            tokens = tokenizer(prompt, return_tensors="pt").to(device)
+            tokens = tokenizer(prompt,
+                               padding="max_length",
+                               max_length=77,
+                               truncation=True,
+                               return_tensors="pt").to(device)
             # Get embeddings from our implementation
             outputs1 = model1(input_ids=tokens.input_ids,
                               output_hidden_states=True)

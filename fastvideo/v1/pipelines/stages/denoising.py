@@ -3,8 +3,11 @@
 Denoising stage for diffusion pipelines.
 """
 
+import gc
 import inspect
-from typing import Any, Dict, Iterable, Optional
+import weakref
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 from einops import rearrange
@@ -12,13 +15,15 @@ from tqdm.auto import tqdm
 
 from fastvideo.v1.attention import get_attn_backend
 from fastvideo.v1.configs.pipelines.base import STA_Mode
-from fastvideo.v1.distributed import (get_sp_parallel_rank, get_sp_world_size,
-                                      get_torch_device, get_world_group)
+from fastvideo.v1.distributed import (get_local_torch_device,
+                                      get_sp_parallel_rank, get_sp_world_size,
+                                      get_world_group)
 from fastvideo.v1.distributed.communication_op import (
     sequence_model_parallel_all_gather)
 from fastvideo.v1.fastvideo_args import FastVideoArgs
 from fastvideo.v1.forward_context import set_forward_context
 from fastvideo.v1.logger import init_logger
+from fastvideo.v1.models.loader.component_loader import TransformerLoader
 from fastvideo.v1.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.v1.pipelines.stages.base import PipelineStage
 from fastvideo.v1.pipelines.stages.validators import StageValidators as V
@@ -51,10 +56,11 @@ class DenoisingStage(PipelineStage):
     the initial noise into the final output.
     """
 
-    def __init__(self, transformer, scheduler) -> None:
+    def __init__(self, transformer, scheduler, pipeline=None) -> None:
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
+        self.pipeline = weakref.ref(pipeline) if pipeline else None
         attn_head_size = self.transformer.hidden_size // self.transformer.num_attention_heads
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
@@ -81,6 +87,15 @@ class DenoisingStage(PipelineStage):
         Returns:
             The batch with denoised latents.
         """
+        pipeline = self.pipeline() if self.pipeline else None
+        if not fastvideo_args.model_loaded["transformer"]:
+            loader = TransformerLoader()
+            self.transformer = loader.load(
+                fastvideo_args.model_paths["transformer"], fastvideo_args)
+            if pipeline:
+                pipeline.add_module("transformer", self.transformer)
+            fastvideo_args.model_loaded["transformer"] = True
+
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
@@ -192,7 +207,7 @@ class DenoisingStage(PipelineStage):
                         [fastvideo_args.pipeline_config.embedded_cfg_scale] *
                         latent_model_input.shape[0],
                         dtype=torch.float32,
-                        device=get_torch_device(),
+                        device=get_local_torch_device(),
                     ).to(target_dtype) *
                     1000.0 if fastvideo_args.pipeline_config.embedded_cfg_scale
                     is not None else None)
@@ -299,13 +314,22 @@ class DenoisingStage(PipelineStage):
         if st_attn_available and self.attn_backend == SlidingTileAttentionBackend and fastvideo_args.STA_mode == STA_Mode.STA_SEARCHING:
             self.save_sta_search_results(batch)
 
-        if fastvideo_args.use_cpu_offload:
-            self.transformer.to('cpu')
-            torch.cuda.empty_cache()
+        # deallocate transformer if on mps
+        if torch.backends.mps.is_available():
+            logger.info("Memory before deallocating transformer: %s",
+                        torch.mps.current_allocated_memory())
+            del self.transformer
+            if pipeline is not None and "transformer" in pipeline.modules:
+                del pipeline.modules["transformer"]
+            gc.collect()
+            torch.mps.empty_cache()
+            fastvideo_args.model_loaded["transformer"] = False
+            logger.info("Memory after deallocating transformer: %s",
+                        torch.mps.current_allocated_memory())
 
         return batch
 
-    def prepare_extra_func_kwargs(self, func, kwargs) -> Dict[str, Any]:
+    def prepare_extra_func_kwargs(self, func, kwargs) -> dict[str, Any]:
         """
         Prepare extra kwargs for the scheduler step / denoise step.
         
@@ -324,8 +348,8 @@ class DenoisingStage(PipelineStage):
         return extra_step_kwargs
 
     def progress_bar(self,
-                     iterable: Optional[Iterable] = None,
-                     total: Optional[int] = None) -> tqdm:
+                     iterable: Iterable | None = None,
+                     total: int | None = None) -> tqdm:
         """
         Create a progress bar for the denoising process.
         

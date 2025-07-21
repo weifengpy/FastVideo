@@ -14,10 +14,14 @@ class LatentDataset(Dataset):
         json_path,
         num_latent_t,
         cfg_rate,
+        seed: int = 42,
     ) -> None:
         # data_merge_path: video_dir, latent_dir, prompt_embed_dir, json_path
         self.json_path = json_path
         self.cfg_rate = cfg_rate
+        self.seed = seed
+        # Create a seeded random generator for deterministic CFG
+        self.rng = random.Random(seed)
         self.datase_dir_path = os.path.dirname(json_path)
         self.video_dir = os.path.join(self.datase_dir_path, "video")
         self.latent_dir = os.path.join(self.datase_dir_path, "latent")
@@ -50,7 +54,7 @@ class LatentDataset(Dataset):
             weights_only=True,
         )
         latent = latent.squeeze(0)[:, -self.num_latent_t:]
-        if random.random() < self.cfg_rate:
+        if self.rng.random() < self.cfg_rate:
             prompt_embed = self.uncond_prompt_embed
             prompt_attention_mask = self.uncond_prompt_mask
         else:
@@ -76,7 +80,7 @@ def latent_collate_function(batch):
     # latent_attn_mask: # b t h w
     # text_attn_mask: b 1 l
     # needs to check if the latent/prompt' size and apply padding & attn mask
-    latents, prompt_embeds, prompt_attention_masks = zip(*batch)
+    latents, prompt_embeds, prompt_attention_masks = zip(*batch, strict=True)
     # calculate max shape
     max_t = max([latent.shape[1] for latent in latents])
     max_h = max([latent.shape[2] for latent in latents])

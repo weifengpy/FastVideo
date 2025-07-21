@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
 
 import torch
 
@@ -32,7 +31,7 @@ class HunyuanVideoArchConfig(DiTArchConfig):
     _compile_conditions: list = field(
         default_factory=lambda: [is_double_block, is_single_block, is_txt_in])
 
-    _param_names_mapping: dict = field(
+    param_names_mapping: dict = field(
         default_factory=lambda: {
             # 1. context_embedder.time_text_embed submodules (specific rules, applied first):
             r"^context_embedder\.time_text_embed\.timestep_embedder\.linear_1\.(.*)$":
@@ -147,8 +146,8 @@ class HunyuanVideoArchConfig(DiTArchConfig):
             r"final_layer.linear.\1",
         })
 
-    # Reverse mapping for saving checkpoints: training -> diffusers
-    _reverse_param_names_mapping: dict = field(default_factory=lambda: {})
+    # Reverse mapping for saving checkpoints: custom -> hf
+    reverse_param_names_mapping: dict = field(default_factory=lambda: {})
 
     patch_size: int = 2
     patch_size_t: int = 1
@@ -160,14 +159,14 @@ class HunyuanVideoArchConfig(DiTArchConfig):
     num_layers: int = 20
     num_single_layers: int = 40
     num_refiner_layers: int = 2
-    rope_axes_dim: Tuple[int, int, int] = (16, 56, 56)
+    rope_axes_dim: tuple[int, int, int] = (16, 56, 56)
     guidance_embeds: bool = False
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     text_embed_dim: int = 4096
     pooled_projection_dim: int = 768
     rope_theta: int = 256
     qk_norm: str = "rms_norm"
-    exclude_lora_layers: List[str] = field(
+    exclude_lora_layers: list[str] = field(
         default_factory=lambda: ["img_in", "txt_in", "time_in", "vector_in"])
 
     def __post_init__(self):

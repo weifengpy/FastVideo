@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any
 
 import torch
 from torch import nn
@@ -13,18 +13,18 @@ from fastvideo.v1.platforms import AttentionBackendEnum
 class BaseDiT(nn.Module, ABC):
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
-    _param_names_mapping: dict
-    _reverse_param_names_mapping: dict
+    param_names_mapping: dict
+    reverse_param_names_mapping: dict
     hidden_size: int
     num_attention_heads: int
     num_channels_latents: int
     # always supports torch_sdpa
-    _supported_attention_backends: Tuple[
+    _supported_attention_backends: tuple[
         AttentionBackendEnum, ...] = DiTConfig()._supported_attention_backends
 
     def __init_subclass__(cls) -> None:
         required_class_attrs = [
-            "_fsdp_shard_conditions", "_param_names_mapping",
+            "_fsdp_shard_conditions", "param_names_mapping",
             "_compile_conditions"
         ]
         super().__init_subclass__()
@@ -47,10 +47,10 @@ class BaseDiT(nn.Module, ABC):
     @abstractmethod
     def forward(self,
                 hidden_states: torch.Tensor,
-                encoder_hidden_states: Union[torch.Tensor, List[torch.Tensor]],
+                encoder_hidden_states: torch.Tensor | list[torch.Tensor],
                 timestep: torch.LongTensor,
-                encoder_hidden_states_image: Optional[Union[
-                    torch.Tensor, List[torch.Tensor]]] = None,
+                encoder_hidden_states_image: torch.Tensor | list[torch.Tensor]
+                | None = None,
                 guidance=None,
                 **kwargs) -> torch.Tensor:
         pass
@@ -66,7 +66,7 @@ class BaseDiT(nn.Module, ABC):
                 )
 
     @property
-    def supported_attention_backends(self) -> Tuple[AttentionBackendEnum, ...]:
+    def supported_attention_backends(self) -> tuple[AttentionBackendEnum, ...]:
         return self._supported_attention_backends
 
 
@@ -78,15 +78,15 @@ class CachableDiT(BaseDiT):
     """
     # These are required class attributes that should be overridden by concrete implementations
     _fsdp_shard_conditions = []
-    _param_names_mapping = {}
-    _reverse_param_names_mapping = {}
-    _lora_param_names_mapping: dict = {}
+    param_names_mapping = {}
+    reverse_param_names_mapping = {}
+    lora_param_names_mapping: dict = {}
     # Ensure these instance attributes are properly defined in subclasses
     hidden_size: int
     num_attention_heads: int
     num_channels_latents: int
     # always supports torch_sdpa
-    _supported_attention_backends: Tuple[
+    _supported_attention_backends: tuple[
         AttentionBackendEnum, ...] = DiTConfig()._supported_attention_backends
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:

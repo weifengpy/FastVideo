@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
 import faulthandler
-import gc
 import multiprocessing as mp
 import os
 import signal
 import sys
 from multiprocessing.connection import Connection
-from typing import Any, Dict, TextIO, cast
+from typing import Any, TextIO, cast
 
 import psutil
 import torch
@@ -15,9 +14,11 @@ import torch
 from fastvideo.v1.distributed import (
     cleanup_dist_env_and_memory,
     maybe_init_distributed_environment_and_model_parallel)
+from fastvideo.v1.distributed.parallel_state import get_local_torch_device
 from fastvideo.v1.fastvideo_args import FastVideoArgs
 from fastvideo.v1.logger import init_logger
 from fastvideo.v1.pipelines import ForwardBatch, build_pipeline
+from fastvideo.v1.platforms import current_platform
 from fastvideo.v1.utils import (get_exception_traceback,
                                 kill_itself_when_parent_died)
 
@@ -62,16 +63,19 @@ class Worker:
         # Related issue:
         # https://discuss.pytorch.org/t/cuda-allocation-lifetime-for-inputs-to-distributed-all-reduce/191573
         os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
-
         # This env var set by Ray causes exceptions with graph building.
         os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
-        self.device = torch.device(f"cuda:{self.local_rank}")
-        torch.cuda.set_device(self.device)
+
+        # Platform-agnostic device initialization
+        self.device = get_local_torch_device()
 
         # _check_if_gpu_supports_dtype(self.model_config.dtype)
-        gc.collect()
-        torch.cuda.empty_cache()
-        self.init_gpu_memory = torch.cuda.mem_get_info()[0]
+        if current_platform.is_cuda_alike():
+            torch.cuda.empty_cache()
+            self.init_gpu_memory = torch.cuda.mem_get_info()[0]
+        else:
+            # For MPS, we can't get memory info the same way
+            self.init_gpu_memory = 0
 
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -93,7 +97,7 @@ class Worker:
     def set_lora_adapter(self, lora_nickname: str, lora_path: str) -> None:
         self.pipeline.set_lora_adapter(lora_nickname, lora_path)
 
-    def shutdown(self) -> Dict[str, Any]:
+    def shutdown(self) -> dict[str, Any]:
         """Gracefully shut down the worker process"""
         logger.info("Worker %d shutting down...",
                     self.rank,
@@ -102,9 +106,6 @@ class Worker:
         if hasattr(self, 'pipeline') and self.pipeline is not None:
             # Clean up pipeline resources if needed
             pass
-        # Release CUDA resources
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         # Destroy the distributed environment
         cleanup_dist_env_and_memory(shutdown_ray=False)
@@ -133,13 +134,18 @@ class Worker:
 
                 # Handle regular RPC calls
                 if method_name == 'execute_forward':
-                    gc.collect()
-                    torch.cuda.empty_cache()
                     forward_batch = recv_rpc['kwargs']['forward_batch']
                     fastvideo_args = recv_rpc['kwargs']['fastvideo_args']
                     output_batch = self.execute_forward(forward_batch,
                                                         fastvideo_args)
                     self.pipe.send({"output_batch": output_batch.output.cpu()})
+                elif method_name == 'set_lora_adapter':
+                    lora_nickname = recv_rpc['kwargs']['lora_nickname']
+                    lora_path = recv_rpc['kwargs']['lora_path']
+                    self.set_lora_adapter(lora_nickname, lora_path)
+                    logger.info("Worker %d set LoRA adapter %s with path %s",
+                                self.rank, lora_nickname, lora_path)
+                    self.pipe.send({"status": "lora_adapter_set"})
                 else:
                     # Handle other methods dynamically if needed
                     args = recv_rpc.get('args', ())

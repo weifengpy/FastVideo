@@ -4,10 +4,8 @@ import os
 import numpy as np
 import pytest
 import torch
-from transformers import AutoConfig
-
-from fastvideo.models.hunyuan.text_encoder import (load_text_encoder,
-                                                   load_tokenizer)
+from transformers import AutoConfig, AutoTokenizer, LlamaModel
+import gc
 from fastvideo.v1.configs.pipelines import PipelineConfig
 from fastvideo.v1.forward_context import set_forward_context
 from fastvideo.v1.fastvideo_args import FastVideoArgs
@@ -15,7 +13,8 @@ from fastvideo.v1.logger import init_logger
 from fastvideo.v1.models.loader.component_loader import TextEncoderLoader
 from fastvideo.v1.utils import maybe_download_model
 from fastvideo.v1.configs.models.encoders import LlamaConfig
-
+from torch.distributed.tensor import DTensor
+from torch.testing import assert_close
 logger = init_logger(__name__)
 
 os.environ["MASTER_ADDR"] = "localhost"
@@ -50,19 +49,14 @@ def test_llama_encoder():
     hf_config = AutoConfig.from_pretrained(TEXT_ENCODER_PATH)
     print(hf_config)
 
-    # Load our implementation using the loader from text_encoder/__init__.py
-    model1, _ = load_text_encoder(text_encoder_type="llm",
-                                  text_encoder_precision='fp16',
-                                  text_encoder_path=TEXT_ENCODER_PATH,
-                                  logger=logger,
-                                  device=device)
+    # Load HuggingFace implementation
+    model1 = LlamaModel.from_pretrained(TEXT_ENCODER_PATH).to(torch.float16).to(device).eval()
     loader = TextEncoderLoader()
     device = torch.device("cuda:0")
-    model2 = loader.load(TEXT_ENCODER_PATH, "", args)
+    model2 = loader.load(TEXT_ENCODER_PATH, args)
 
     # Convert to float16 and move to device
     # model2 = model2.to(torch.float16)
-    model2 = model2.to(device)
     model2.eval()
 
     # Sanity check weights between the two models
@@ -77,38 +71,30 @@ def test_llama_encoder():
     # Compare a few key parameters
     weight_diffs = []
     # check if embed_tokens are the same
-    print(model1.embed_tokens.weight.shape, model2.embed_tokens.weight.shape)
+    device = model1.embed_tokens.weight.device
     assert torch.allclose(model1.embed_tokens.weight,
-                          model2.embed_tokens.weight)
+                          model2.embed_tokens.weight.to_local().to(device) if isinstance(model2.embed_tokens.weight, DTensor) else model2.embed_tokens.weight.to(device))
     weights = [
         "layers.{}.input_layernorm.weight",
         "layers.{}.post_attention_layernorm.weight"
     ]
-    # for (name1, param1), (name2, param2) in zip(
-    #     sorted(params1.items()), sorted(params2.items())
-    # ):
-    for layer_idx in range(hf_config.num_hidden_layers):
-        for w in weights:
-            name1 = w.format(layer_idx)
-            name2 = w.format(layer_idx)
-            p1 = params1[name1]
-            p2 = params2[name2]
-            # print(type(p2))
-            if "gate_up" in name2:
-                # print("skipping gate_up")
-                continue
-            try:
-                # logger.info(f"Parameter: {name1} vs {name2}")
-                max_diff = torch.max(torch.abs(p1 - p2)).item()
-                mean_diff = torch.mean(torch.abs(p1 - p2)).item()
-                weight_diffs.append((name1, name2, max_diff, mean_diff))
-                # logger.info(f"  Max diff: {max_diff}, Mean diff: {mean_diff}")
-            except Exception as e:
-                logger.info("Error comparing %s and %s: %s", name1, name2, e)
 
-    tokenizer, _ = load_tokenizer(tokenizer_type="llm",
-                                  tokenizer_path=TOKENIZER_PATH,
-                                  logger=logger)
+    for name1, param1 in sorted(params1.items()):
+        name2 = name1
+        skip = False
+        for param_name, weight_name, shard_id in model2.config.arch_config.stacked_params_mapping:
+            if weight_name not in name1:
+                skip = True
+        # stacked params are more troublesome
+        if skip:
+            continue
+        param2 = params2[name2]
+        param2 = param2.to_local().to(device) if isinstance(param2, DTensor) else param2.to(device)
+        assert_close(param1, param2, atol=1e-4, rtol=1e-4)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
 
     # Test with some sample prompts
     prompts = [
@@ -124,7 +110,11 @@ def test_llama_encoder():
             logger.info("Testing prompt: '%s'", prompt)
 
             # Tokenize the prompt
-            tokens = tokenizer(prompt, return_tensors="pt").to(device)
+            tokens = tokenizer(prompt,
+                               padding="max_length",
+                               max_length=512,
+                               truncation=True,
+                               return_tensors="pt").to(device)
 
             # Get outputs from our implementation
             # filter out padding input_ids

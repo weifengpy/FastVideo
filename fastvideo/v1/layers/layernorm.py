@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/layernorm.py
 """Custom normalization layers."""
-from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from fastvideo.v1.layers.custom_op import CustomOp
+from fastvideo.v1.platforms import current_platform
 
 
 @CustomOp.register("rms_norm")
@@ -23,7 +23,7 @@ class RMSNorm(CustomOp):
         hidden_size: int,
         eps: float = 1e-6,
         dtype: torch.dtype = torch.float32,
-        var_hidden_size: Optional[int] = None,
+        var_hidden_size: int | None = None,
         has_weight: bool = True,
     ) -> None:
         super().__init__()
@@ -34,7 +34,8 @@ class RMSNorm(CustomOp):
                                        else var_hidden_size)
         self.has_weight = has_weight
 
-        self.weight = torch.ones(hidden_size)
+        self.weight = torch.ones(hidden_size) if current_platform.is_cuda_alike(
+        ) else torch.ones(hidden_size, dtype=dtype)
         if self.has_weight:
             self.weight = nn.Parameter(self.weight)
     
@@ -48,8 +49,8 @@ class RMSNorm(CustomOp):
     def forward_native(
         self,
         x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
         orig_dtype = x.dtype
         x = x.to(torch.float32)
@@ -160,7 +161,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
 
     def forward(self, residual: torch.Tensor, x: torch.Tensor,
                 gate: torch.Tensor, shift: torch.Tensor,
-                scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Apply gated residual connection, followed by layernorm and 
         scale/shift in a single fused operation.
